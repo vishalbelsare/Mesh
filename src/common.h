@@ -29,12 +29,12 @@
 #include <unordered_map>
 #include <vector>
 
+// #include "config.h"
+
 #include "static/log.h"
 
 // from Heap Layers
 #include "utility/ilog2.h"
-
-#include "config.h"
 
 namespace mesh {
 static constexpr bool kMeshingEnabled = MESHING_ENABLED == 1;
