@@ -205,7 +205,7 @@ int MESH_EXPORT pthread_create(pthread_t *thread, const pthread_attr_t *attr, me
   return mesh::runtime().createThread(thread, attr, startRoutine, arg);
 }
 
-void MESH_EXPORT pthread_exit(void *retval) throw() {
+void MESH_EXPORT ATTRIBUTE_NORETURN pthread_exit(void *retval) {
   mesh::runtime().exitThread(retval);
 }
 

@@ -3,6 +3,7 @@ cc_library(
     srcs = [
         "d_assert.cc",
         "global_heap.cc",
+        "libmesh.cc",
         "measure_rss.cc",
         "meshable_arena.cc",
         "real.cc",
@@ -13,9 +14,13 @@ cc_library(
         "*.h",
         "plasma/*.h",
         "rng/*.h",
+        "gnu_wrapper.cc",
         "static/*.h",
         "size_classes.def",
         "vendor/Heap-Layers/**/*.h",
+        "vendor/Heap-Layers/wrappers/gnuwrapper-hooks.cpp",
+        "vendor/Heap-Layers/wrappers/macwrapper.cpp",
+        "wrapper.cc",
     ]),
     copts = [
         # this doesn't seem to work -- both this and -std=c++11 end up on the commandline
