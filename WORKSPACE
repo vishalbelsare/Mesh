@@ -1,8 +1,9 @@
+load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-# master as of 2019/9/15:
-# https://github.com/grailbio/bazel-toolchain/commit/df0f2eb6fe698b4483bb2d5b5670c17ac69c6362
 llvm_toolchain_commit = "df0f2eb6fe698b4483bb2d5b5670c17ac69c6362"
+
+googletest_commit = "f2fb48c3b3d79a75a88a99fba6576b25d42ec528"
 
 http_archive(
     name = "com_grail_bazel_toolchain",
@@ -21,3 +22,10 @@ llvm_toolchain(
 load("@llvm_toolchain//:toolchains.bzl", "llvm_register_toolchains")
 
 llvm_register_toolchains()
+
+git_repository(
+    name = "com_google_googletest",
+    commit = googletest_commit,
+    remote = "https://github.com/google/googletest.git",
+    shallow_since = "1565193450 -0400",
+)
