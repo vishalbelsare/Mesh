@@ -15,14 +15,13 @@
 #include "bitmap.h"
 #include "fixed_array.h"
 #include "internal.h"
+#include "size_class_reciprocals.h"
 
 #include "rng/mwc.h"
 
 #include "heaplayers.h"
 
 namespace mesh {
-
-class MiniHeap;
 
 class Flags {
 private:
@@ -35,6 +34,7 @@ private:
   static constexpr uint32_t FreelistIdShift = 6;
   static constexpr uint32_t ShuffleVectorOffsetShift = 8;
   static constexpr uint32_t MaxCountShift = 16;
+  static constexpr uint32_t PendingOffset = 27;
   static constexpr uint32_t MeshedOffset = 30;
 
   inline void ATTRIBUTE_ALWAYS_INLINE setMasked(uint32_t mask, uint32_t newVal) {
@@ -55,12 +55,12 @@ public:
     d_assert((sizeClass & ((1 << FreelistIdShift) - 1)) == sizeClass);
     d_assert(svOffset < 255);
     d_assert_msg(sizeClass < 255, "sizeClass: %u", sizeClass);
-    d_assert(maxCount <= 256);
+    d_assert_msg(maxCount <= 1024, "maxCount: %u (max 1024 for bitmap limit)", maxCount);
     d_assert(this->maxCount() == maxCount);
   }
 
   inline uint32_t freelistId() const {
-    return (_flags.load(std::memory_order_seq_cst) >> FreelistIdShift) & 0x3;
+    return (_flags.load(std::memory_order_acquire) >> FreelistIdShift) & 0x3;
   }
 
   inline void setFreelistId(uint32_t freelistId) {
@@ -71,17 +71,41 @@ public:
     setMasked(mask, newVal);
   }
 
+  // Atomically set pending flag if current state is Full.
+  // FreelisId remains Full. Returns true on success.
+  inline bool trySetPendingFromFull() {
+    constexpr uint32_t freelistMask = static_cast<uint32_t>(0x3) << FreelistIdShift;
+    constexpr uint32_t fullVal = static_cast<uint32_t>(list::Full) << FreelistIdShift;
+    constexpr uint32_t pendingBit = static_cast<uint32_t>(1) << PendingOffset;
+
+    uint32_t oldFlags = _flags.load(std::memory_order_relaxed);
+    while (true) {
+      if ((oldFlags & freelistMask) != fullVal) {
+        return false;
+      }
+      if (oldFlags & pendingBit) {
+        return false;  // Already pending
+      }
+      // Set pending flag, keep freelistId as Full
+      uint32_t desired = oldFlags | pendingBit;
+      if (_flags.compare_exchange_weak(oldFlags, desired, std::memory_order_release, std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+  }
+
   inline uint32_t maxCount() const {
     // XXX: does this assume little endian?
-    return (_flags.load(std::memory_order_seq_cst) >> MaxCountShift) & 0x1ff;
+    // 0x7ff = 11 bits, supports values up to 2047 (we cap at 1024 for bitmap limit)
+    return (_flags.load(std::memory_order_acquire) >> MaxCountShift) & 0x7ff;
   }
 
   inline uint32_t sizeClass() const {
-    return (_flags.load(std::memory_order_seq_cst) >> SizeClassShift) & 0x3f;
+    return (_flags.load(std::memory_order_acquire) >> SizeClassShift) & 0x3f;
   }
 
   inline uint8_t svOffset() const {
-    return (_flags.load(std::memory_order_seq_cst) >> ShuffleVectorOffsetShift) & 0xff;
+    return (_flags.load(std::memory_order_acquire) >> ShuffleVectorOffsetShift) & 0xff;
   }
 
   inline void setSvOffset(uint8_t off) {
@@ -101,6 +125,18 @@ public:
 
   inline bool ATTRIBUTE_ALWAYS_INLINE isMeshed() const {
     return is(MeshedOffset);
+  }
+
+  inline void setPending() {
+    set(PendingOffset);
+  }
+
+  inline void clearPending() {
+    unset(PendingOffset);
+  }
+
+  inline bool ATTRIBUTE_ALWAYS_INLINE isPending() const {
+    return is(PendingOffset);
   }
 
 private:
@@ -136,36 +172,28 @@ private:
   std::atomic<uint32_t> _flags;
 };
 
+template <size_t PageSize>
 class MiniHeap {
 private:
   DISALLOW_COPY_AND_ASSIGN(MiniHeap);
 
 public:
-  MiniHeap(void *arenaBegin, Span span, size_t objectCount, size_t objectSize)
-      : _bitmap(objectCount),
-        _span(span),
-        _flags(objectCount, objectCount > 1 ? SizeMap::SizeClass(objectSize) : 1, 0, list::Attached),
-        _objectSizeReciprocal(1.0 / (float)objectSize) {
-    // debug("sizeof(MiniHeap): %zu", sizeof(MiniHeap));
+  using BitmapType = internal::Bitmap<PageSize>;
+  using ListEntryType = MiniHeapListEntry<PageSize>;
+  static constexpr size_t kPageSize = PageSize;
+  static constexpr unsigned kPageShift = __builtin_ctzl(PageSize);
 
+  MiniHeap(void *arenaBegin, Span span, size_t objectCount, size_t objectSize)
+      : _span(span),
+        _flags(objectCount, objectCount > 1 ? SizeMap::SizeClass(objectSize) : 1, 0, list::Attached),
+        _bitmap(objectCount) {
     d_assert(_bitmap.inUseCount() == 0);
 
-    const auto expectedSpanSize = _span.byteLength();
+    const auto expectedSpanSize = static_cast<size_t>(_span.length) << kPageShift;
     d_assert_msg(expectedSpanSize == spanSize(), "span size %zu == %zu (%u, %u)", expectedSpanSize, spanSize(),
                  maxCount(), this->objectSize());
 
-    // d_assert_msg(spanSize == static_cast<size_t>(_spanSize), "%zu != %hu", spanSize, _spanSize);
-    // d_assert_msg(objectSize == static_cast<size_t>(objectSize()), "%zu != %hu", objectSize, _objectSize);
-
     d_assert(!_nextMeshed.hasValue());
-
-    // debug("new:\n");
-    // dumpDebug();
-  }
-
-  ~MiniHeap() {
-    // debug("destruct:\n");
-    // dumpDebug();
   }
 
   inline Span span() const {
@@ -238,7 +266,7 @@ public:
   }
 
   inline size_t spanSize() const {
-    return _span.byteLength();
+    return static_cast<size_t>(_span.length) << kPageShift;
   }
 
   inline uint32_t ATTRIBUTE_ALWAYS_INLINE maxCount() const {
@@ -251,11 +279,9 @@ public:
 
   inline size_t objectSize() const {
     if (likely(!isLargeAlloc())) {
-      // this doesn't handle all the corner cases of roundf(3),
-      // but it does work for all of our small object size classes
-      return static_cast<size_t>(1 / _objectSizeReciprocal + 0.5);
+      return static_cast<size_t>(SizeMap::class_to_size(sizeClass()));
     } else {
-      return _span.length * kPageSize;
+      return static_cast<size_t>(_span.length) << kPageShift;
     }
   }
 
@@ -265,7 +291,7 @@ public:
 
   inline uintptr_t getSpanStart(const void *arenaBegin) const {
     const auto beginval = reinterpret_cast<uintptr_t>(arenaBegin);
-    return beginval + _span.offset * kPageSize;
+    return beginval + (static_cast<size_t>(_span.offset) << kPageShift);
   }
 
   inline bool ATTRIBUTE_ALWAYS_INLINE isEmpty() const {
@@ -288,7 +314,7 @@ public:
     _flags.setMeshed();
   }
 
-  inline void setAttached(pid_t current, MiniHeapListEntry *listHead) {
+  inline void setAttached(pid_t current, ListEntryType *listHead) {
     // mesh::debug("MiniHeap(%p:%5zu): current <- %u\n", this, objectSize(), current);
     _current.store(current, std::memory_order::memory_order_release);
     if (listHead != nullptr) {
@@ -314,6 +340,27 @@ public:
     _flags.setFreelistId(id);
   }
 
+  // Atomically set pending flag if current state is Full.
+  inline bool trySetPendingFromFull() {
+    return _flags.trySetPendingFromFull();
+  }
+
+  inline bool isPending() const {
+    return _flags.isPending();
+  }
+
+  inline void clearPending() {
+    _flags.clearPending();
+  }
+
+  inline MiniHeapID pendingNext() const {
+    return _pendingNext;
+  }
+
+  inline void setPendingNext(MiniHeapID next) {
+    _pendingNext = next;
+  }
+
   inline pid_t current() const {
     return _current.load(std::memory_order::memory_order_acquire);
   }
@@ -336,7 +383,7 @@ public:
   }
 
   inline bool isMeshingCandidate() const {
-    return !isAttached() && objectSize() < kPageSize;
+    return !isAttached() && objectSize() < PageSize;
   }
 
   /// Returns the fraction full (in the range [0, 1]) that this miniheap is.
@@ -344,19 +391,20 @@ public:
     return static_cast<double>(inUseCount()) / static_cast<double>(maxCount());
   }
 
-  internal::RelaxedFixedBitmap takeBitmap() {
+  template <size_t MaxBits = PageSize / kMinObjectSize>
+  internal::RelaxedFixedBitmap<PageSize> takeBitmap() {
     const auto capacity = this->maxCount();
-    internal::RelaxedFixedBitmap zero{capacity};
-    internal::RelaxedFixedBitmap result{capacity};
+    internal::RelaxedFixedBitmap<PageSize> zero{capacity};
+    internal::RelaxedFixedBitmap<PageSize> result{capacity};
     _bitmap.setAndExchangeAll(result.mut_bits(), zero.bits());
     return result;
   }
 
-  const internal::Bitmap &bitmap() const {
+  const BitmapType &bitmap() const {
     return _bitmap;
   }
 
-  internal::Bitmap &writableBitmap() {
+  BitmapType &writableBitmap() {
     return _bitmap;
   }
 
@@ -366,7 +414,7 @@ public:
     if (!_nextMeshed.hasValue()) {
       _nextMeshed = id;
     } else {
-      GetMiniHeap(_nextMeshed)->trackMeshedSpan(id);
+      GetMiniHeap<MiniHeap>(_nextMeshed)->trackMeshedSpan(id);
     }
   }
 
@@ -377,7 +425,7 @@ public:
       return;
 
     if (_nextMeshed.hasValue()) {
-      const auto mh = GetMiniHeap(_nextMeshed);
+      const auto mh = GetMiniHeap<MiniHeap>(_nextMeshed);
       mh->forEachMeshed(cb);
     }
   }
@@ -388,7 +436,7 @@ public:
       return;
 
     if (_nextMeshed.hasValue()) {
-      auto mh = GetMiniHeap(_nextMeshed);
+      auto mh = GetMiniHeap<MiniHeap>(_nextMeshed);
       mh->forEachMeshed(cb);
     }
   }
@@ -411,13 +459,13 @@ public:
       count++;
 
       auto next = mh->_nextMeshed;
-      mh = next.hasValue() ? GetMiniHeap(next) : nullptr;
+      mh = next.hasValue() ? GetMiniHeap<MiniHeap>(next) : nullptr;
     }
 
     return count;
   }
 
-  MiniHeapListEntry *getFreelist() {
+  ListEntryType *getFreelist() {
     return &_freelist;
   }
 
@@ -444,32 +492,33 @@ public:
     const auto heapPages = spanSize() / HL::CPUInfo::PageSize;
     const size_t inUseCount = this->inUseCount();
     const size_t meshCount = this->meshCount();
+    const auto spanOffset = static_cast<size_t>(_span.offset) << kPageShift;
     mesh::debug(
         "MiniHeap(%p:%5zu): %3zu objects on %2zu pages (inUse: %zu, spans: %zu)\t%p-%p\tFreelist{prev:%u, next:%u}\n",
-        this, objectSize(), maxCount(), heapPages, inUseCount, meshCount, _span.offset * kPageSize,
-        _span.offset * kPageSize + spanSize(), _freelist.prev(), _freelist.next());
+        this, objectSize(), maxCount(), heapPages, inUseCount, meshCount, spanOffset, spanOffset + spanSize(),
+        _freelist.prev(), _freelist.next());
     mesh::debug("\t%s\n", _bitmap.to_string(maxCount()).c_str());
   }
 
   // this only works for unmeshed miniheaps
-  inline uint8_t ATTRIBUTE_ALWAYS_INLINE getUnmeshedOff(const void *arenaBegin, void *ptr) const {
+  inline uint16_t ATTRIBUTE_ALWAYS_INLINE getUnmeshedOff(const void *arenaBegin, void *ptr) const {
     const auto ptrval = reinterpret_cast<uintptr_t>(ptr);
 
-    uintptr_t span = reinterpret_cast<uintptr_t>(arenaBegin) + _span.offset * kPageSize;
+    uintptr_t span = reinterpret_cast<uintptr_t>(arenaBegin) + (static_cast<size_t>(_span.offset) << kPageShift);
     d_assert(span != 0);
 
-    const size_t off = (ptrval - span) * _objectSizeReciprocal;
+    const size_t off = float_recip::computeIndex(ptrval - span, sizeClass());
     d_assert(off < maxCount());
 
     return off;
   }
 
-  inline uint8_t ATTRIBUTE_ALWAYS_INLINE getOff(const void *arenaBegin, void *ptr) const {
+  inline uint16_t ATTRIBUTE_ALWAYS_INLINE getOff(const void *arenaBegin, void *ptr) const {
     const auto span = spanStart(reinterpret_cast<uintptr_t>(arenaBegin), ptr);
     d_assert(span != 0);
     const auto ptrval = reinterpret_cast<uintptr_t>(ptr);
 
-    const size_t off = (ptrval - span) * _objectSizeReciprocal;
+    const size_t off = float_recip::computeIndex(ptrval - span, sizeClass());
     d_assert(off < maxCount());
 
     return off;
@@ -478,11 +527,11 @@ public:
 protected:
   inline uintptr_t ATTRIBUTE_ALWAYS_INLINE spanStart(uintptr_t arenaBegin, void *ptr) const {
     const auto ptrval = reinterpret_cast<uintptr_t>(ptr);
-    const auto len = _span.byteLength();
+    const auto len = static_cast<size_t>(_span.length) << kPageShift;
 
     // manually unroll loop once to capture the common case of
     // un-meshed miniheaps
-    uintptr_t spanptr = arenaBegin + _span.offset * kPageSize;
+    uintptr_t spanptr = arenaBegin + (static_cast<size_t>(_span.offset) << kPageShift);
     if (likely(spanptr <= ptrval && ptrval < spanptr + len)) {
       return spanptr;
     }
@@ -491,7 +540,7 @@ protected:
   }
 
   uintptr_t ATTRIBUTE_NEVER_INLINE spanStartSlowpath(uintptr_t arenaBegin, uintptr_t ptrval) const {
-    const auto len = _span.byteLength();
+    const auto len = static_cast<size_t>(_span.length) << kPageShift;
     uintptr_t spanptr = 0;
 
     const MiniHeap *mh = this;
@@ -500,9 +549,9 @@ protected:
         abort();
       }
 
-      mh = GetMiniHeap(mh->_nextMeshed);
+      mh = GetMiniHeap<MiniHeap>(mh->_nextMeshed);
 
-      const uintptr_t meshedSpanptr = arenaBegin + mh->span().offset * kPageSize;
+      const uintptr_t meshedSpanptr = arenaBegin + (static_cast<size_t>(mh->span().offset) << kPageShift);
       if (meshedSpanptr <= ptrval && ptrval < meshedSpanptr + len) {
         spanptr = meshedSpanptr;
         break;
@@ -512,22 +561,22 @@ protected:
     return spanptr;
   }
 
-  internal::Bitmap _bitmap;           // 32 bytes 32
-  const Span _span;                   // 8        40
-  MiniHeapListEntry _freelist{};      // 8        48
-  atomic<pid_t> _current{0};          // 4        52
-  Flags _flags;                       // 4        56
-  const float _objectSizeReciprocal;  // 4        60
-  MiniHeapID _nextMeshed{};           // 4        64
+  const Span _span;           // 8 bytes
+  ListEntryType _freelist{};  // 8 bytes
+  atomic<pid_t> _current{0};  // 4 bytes
+  Flags _flags;               // 4 bytes
+  MiniHeapID _nextMeshed{};   // 4 bytes
+  MiniHeapID _pendingNext{};  // 4 bytes (for lock-free pending list, separate from _freelist)
+  BitmapType _bitmap;         // 32 bytes (4K) or 128 bytes (16K)
 };
 
-typedef FixedArray<MiniHeap, 63> MiniHeapArray;
+template <size_t PageSize>
+using MiniHeapArray = FixedArray<MiniHeap<PageSize>, 63>;
 
 static_assert(sizeof(pid_t) == 4, "pid_t not 32-bits!");
-static_assert(sizeof(mesh::internal::Bitmap) == 32, "Bitmap too big!");
-static_assert(sizeof(MiniHeap) == 64, "MiniHeap too big!");
-static_assert(sizeof(MiniHeap) == kMiniHeapSize, "MiniHeap size mismatch");
-static_assert(sizeof(MiniHeapArray) == 64 * sizeof(void *), "MiniHeapArray too big!");
+static_assert(sizeof(MiniHeap<4096>) == 64, "MiniHeap<4K> should be 64 bytes!");
+static_assert(sizeof(MiniHeap<16384>) == 160, "MiniHeap<16K> should be 160 bytes!");
+static_assert(sizeof(MiniHeapArray<4096>) == 64 * sizeof(void *), "MiniHeapArray too big!");
 }  // namespace mesh
 
 #endif  // MESH_MINI_HEAP_H

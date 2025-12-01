@@ -5,10 +5,12 @@
 *.so
 *.pyc
 TAGS
+/third_party
 /src/config.h
 /src/test/fork-example
 /src/test/thread-example
 /unit.test
+/*.old
 /meshing-benchmark
 config.mk
 /build
@@ -22,6 +24,8 @@ config.mk
 __pycache__
 /perf.data
 /perf.data.old
+/perf-*.data
+/flamegraph*.svg
 /src/test/local-alloc
 /src/test/local-alloc-glibc
 /src/test/big-alloc

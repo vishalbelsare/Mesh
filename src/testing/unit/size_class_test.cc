@@ -9,6 +9,7 @@
 
 #include "common.h"
 #include "internal.h"
+#include "size_class_reciprocals.h"
 
 using namespace mesh;
 
@@ -19,7 +20,11 @@ using namespace mesh;
 #define pow2Roundtrip(n) ASSERT_TRUE(n == powerOfTwo::ByteSizeForClass(powerOfTwo::ClassForByteSize(n)))
 
 TEST(SizeClass, MinObjectSize) {
-  ASSERT_EQ(alignof(max_align_t), kMinObjectSize);
+  // kMinObjectSize must be at least as large as the platform's maximum alignment
+  // to ensure all allocations are properly aligned for all C/C++ types.
+  // It can be larger (e.g., 16 on ARM64 where max_align_t is 8) for consistency
+  // across platforms and to simplify size class logic.
+  ASSERT_GE(kMinObjectSize, alignof(max_align_t));
 
   ASSERT_EQ(kMinObjectSize, 16UL);
 
@@ -52,7 +57,7 @@ TEST(SizeClass, Reciprocal) {
     // volatile to avoid the compiler compiling it away
     volatile const float recip = 1.0 / (float)objectSize;
 
-    for (size_t j = 0; j <= kPageSize; j += 8) {
+    for (size_t j = 0; j <= getPageSize(); j += 8) {
       // we depend on this floating point calcuation always being
       // equivalent to the integer division operation
       volatile const size_t off = j * recip;
@@ -62,5 +67,26 @@ TEST(SizeClass, Reciprocal) {
 
     const size_t newObjectSize = __builtin_roundf(1 / recip);
     ASSERT_TRUE(newObjectSize == objectSize);
+  }
+}
+
+TEST(SizeClass, ReciprocalTable) {
+  // Verify that the shared reciprocal table gives correct results
+  // for all size classes and all valid byte offsets
+  for (size_t i = 0; i < kClassSizesMax; i++) {
+    const size_t objectSize = SizeMap::class_to_size(i);
+
+    // Table reciprocal should match computed reciprocal
+    const float tableRecip = float_recip::getReciprocal(i);
+    const float expectedRecip = 1.0f / static_cast<float>(objectSize);
+    ASSERT_FLOAT_EQ(tableRecip, expectedRecip);
+
+    // Test index computation for all valid byte offsets within a page
+    for (size_t j = 0; j <= getPageSize(); j += 8) {
+      const size_t tableOff = float_recip::computeIndex(j, i);
+      const size_t directOff = j / objectSize;
+      ASSERT_EQ(tableOff, directOff) << "Mismatch at sizeClass=" << i << " offset=" << j
+                                     << " objectSize=" << objectSize;
+    }
   }
 }
